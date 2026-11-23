@@ -1,0 +1,12 @@
+[package]
+name = "rust_cut"
+version = "0.1.0"
+edition = "2024"
+description = """cut writes to standard output selected parts of each line of each input file, or standard input if no files are given or for a file name of ‘-’. Synopsis:
+
+cut option... [file]...
+
+In the table which follows, the byte-list, character-list, and field-list are one or more numbers or ranges (two numbers separated by a dash) separated by commas. Bytes, characters, and fields are numbered starting at 1. Incomplete ranges may be given: -m means ‘1-m’; ‘n-’ means ‘n’ through end of line or last field. The list elements can be repeated, can overlap, and can be specified in any order; but the selected input is written in the same order that it is read, and is written exactly once."""
+
+[dependencies]
+clap = { version = "4.6.4", features = ["derive"] }
