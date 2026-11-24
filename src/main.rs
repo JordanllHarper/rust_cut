@@ -1,6 +1,6 @@
 use std::{
     error::Error,
-    fmt::Display,
+    io::Write,
     io::{self, BufRead, Read},
 };
 
@@ -121,35 +121,26 @@ struct Args {
     files: Vec<String>,
 }
 
-#[derive(Debug)]
 enum CutError {
-    File(std::io::Error),
+    Io(std::io::Error),
     BufLines(Box<dyn Error>),
     ArgRange(ArgRangeError),
+    MultipleLists,
 }
 
-impl Display for CutError {
+impl std::fmt::Debug for CutError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let message = match self {
-            CutError::File(error) => format!("Error opening file: {error}"),
+            CutError::Io(error) => format!("Error opening file: {error}"),
             CutError::BufLines(error) => {
                 format!("Error getting the lines from the buf reader: {}", error)
             }
             CutError::ArgRange(err) => match err {
                 ArgRangeError::InvalidRangeInput => String::from("Invalid range input provided"),
             },
+            CutError::MultipleLists => String::from("only 1 type of list may be specified"),
         };
         f.write_str(&message)
-    }
-}
-
-impl Error for CutError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        None
-    }
-
-    fn cause(&self) -> Option<&dyn Error> {
-        self.source()
     }
 }
 
@@ -161,82 +152,48 @@ fn main() -> Result<(), CutError> {
         args.files.push("-".to_string());
     }
     for file in &args.files {
-        let ranges = cut(file, &args)?;
-        println!("{:?}", ranges.character_ranges)
+        cut(file, &mut io::stdout(), &args)?;
     }
     Ok(())
 }
 
-fn cut(file: &str, args: &Args) -> Result<Ranges, CutError> {
-    let byte_ranges = args
-        .bytes
-        .as_ref()
-        .map(|s| get_arg_ranges(s).map_err(CutError::ArgRange))
-        .unwrap_or_else(|| Ok(vec![]))?;
-    let character_ranges = args
-        .characters
-        .as_ref()
-        .map(|s| get_arg_ranges(s).map_err(CutError::ArgRange))
-        .unwrap_or_else(|| Ok(vec![]))?;
-    let field_ranges = args
-        .fields
-        .as_ref()
-        .map(|s| get_arg_ranges(s).map_err(CutError::ArgRange))
-        .unwrap_or_else(|| Ok(vec![]))?;
+fn cut(file: &str, w: &mut impl Write, args: &Args) -> Result<(), CutError> {
+    // we don't allow 2 lists
+    let arg_ranges = match (
+        args.bytes.as_ref(),
+        args.characters.as_ref(),
+        args.fields.as_ref(),
+    ) {
+        (None, None, None) => vec![],
+        (None, None, Some(s)) | (None, Some(s), None) | (Some(s), None, None) => {
+            get_arg_ranges(s).map_err(CutError::ArgRange)?
+        }
+        _ => return Err(CutError::MultipleLists),
+    };
 
     if file == "-" {
-        read_lines(io::stdin(), &byte_ranges, &character_ranges, &field_ranges)
+        read_lines(io::stdin(), w, &arg_ranges)
     } else {
         read_lines(
-            std::fs::File::open(file).map_err(CutError::File)?,
-            &byte_ranges,
-            &character_ranges,
-            &field_ranges,
+            std::fs::File::open(file).map_err(CutError::Io)?,
+            w,
+            &arg_ranges,
         )
     }
 }
 
-struct Ranges {
-    byte_ranges: Vec<Vec<String>>,
-    character_ranges: Vec<Vec<String>>,
-    field_ranges: Vec<Vec<String>>,
-}
-
-impl Ranges {
-    fn new() -> Self {
-        Self {
-            byte_ranges: vec![],
-            character_ranges: vec![],
-            field_ranges: vec![],
-        }
-    }
-}
-
-fn read_lines(
-    r: impl Read,
-    byte_ranges: &[ArgRange],
-    character_ranges: &[ArgRange],
-    field_ranges: &[ArgRange],
-) -> Result<Ranges, CutError> {
+fn read_lines(r: impl Read, w: &mut impl Write, arg_range: &[ArgRange]) -> Result<(), CutError> {
     let lines_iter = io::BufReader::new(r).lines();
-    let mut ranges = Ranges::new();
     for line in lines_iter {
         let line = line.map_err(|err| CutError::BufLines(Box::new(err)))?;
-        ranges
-            .character_ranges
-            .push(get_range_values(&line, character_ranges));
-        ranges
-            .byte_ranges
-            .push(get_range_values(&line, byte_ranges));
-        ranges
-            .field_ranges
-            .push(get_range_values(&line, field_ranges))
-        // format!("{:02x}", b)
+        let mut range_values = get_range_values(&line, arg_range);
+        range_values.push('\n');
+        w.write(&range_values.into_bytes()).map_err(CutError::Io)?;
     }
-    Ok(ranges)
+    Ok(())
 }
 
-fn get_range_values(line: &str, ranges: &[ArgRange]) -> Vec<String> {
+fn get_range_values(line: &str, ranges: &[ArgRange]) -> String {
     ranges
         .iter()
         .map(|r| {
@@ -245,7 +202,7 @@ fn get_range_values(line: &str, ranges: &[ArgRange]) -> Vec<String> {
                 ArgRange::RightOpen { start } => &line[*start - 1..line.len()],
             })
         })
-        .collect::<Vec<String>>()
+        .collect::<String>()
 }
 
 fn get_arg_ranges(s: &str) -> Result<Vec<ArgRange>, ArgRangeError> {
