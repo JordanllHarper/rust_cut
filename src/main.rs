@@ -130,8 +130,14 @@ enum CutError {
 
 impl Display for CutError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let message = "";
-        f.write_str(message)
+        let message = match self {
+            CutError::FileError(error) => format!("Error opening file: {error}"),
+            CutError::BufLinesError(error) => {
+                format!("Error getting the lines from the buf reader: {}", error)
+            }
+            CutError::InvalidRangeInput => String::from("Invalid range input provided"),
+        };
+        f.write_str(&message)
     }
 }
 
