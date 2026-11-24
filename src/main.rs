@@ -123,19 +123,21 @@ struct Args {
 
 #[derive(Debug)]
 enum CutError {
-    FileError(std::io::Error),
-    BufLinesError(Box<dyn Error>),
-    InvalidRangeInput,
+    File(std::io::Error),
+    BufLines(Box<dyn Error>),
+    ArgRange(ArgRangeError),
 }
 
 impl Display for CutError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let message = match self {
-            CutError::FileError(error) => format!("Error opening file: {error}"),
-            CutError::BufLinesError(error) => {
+            CutError::File(error) => format!("Error opening file: {error}"),
+            CutError::BufLines(error) => {
                 format!("Error getting the lines from the buf reader: {}", error)
             }
-            CutError::InvalidRangeInput => String::from("Invalid range input provided"),
+            CutError::ArgRange(err) => match err {
+                ArgRangeError::InvalidRangeInput => String::from("Invalid range input provided"),
+            },
         };
         f.write_str(&message)
     }
@@ -169,24 +171,24 @@ fn cut(file: &str, args: &Args) -> Result<Ranges, CutError> {
     let byte_ranges = args
         .bytes
         .as_ref()
-        .map(|s| get_arg_ranges(s))
+        .map(|s| get_arg_ranges(s).map_err(CutError::ArgRange))
         .unwrap_or_else(|| Ok(vec![]))?;
     let character_ranges = args
         .characters
         .as_ref()
-        .map(|s| get_arg_ranges(s))
+        .map(|s| get_arg_ranges(s).map_err(CutError::ArgRange))
         .unwrap_or_else(|| Ok(vec![]))?;
     let field_ranges = args
         .fields
         .as_ref()
-        .map(|s| get_arg_ranges(s))
+        .map(|s| get_arg_ranges(s).map_err(CutError::ArgRange))
         .unwrap_or_else(|| Ok(vec![]))?;
 
     if file == "-" {
         read_lines(io::stdin(), &byte_ranges, &character_ranges, &field_ranges)
     } else {
         read_lines(
-            std::fs::File::open(file).map_err(CutError::FileError)?,
+            std::fs::File::open(file).map_err(CutError::File)?,
             &byte_ranges,
             &character_ranges,
             &field_ranges,
@@ -219,7 +221,7 @@ fn read_lines(
     let lines_iter = io::BufReader::new(r).lines();
     let mut ranges = Ranges::new();
     for line in lines_iter {
-        let line = line.map_err(|err| CutError::BufLinesError(Box::new(err)))?;
+        let line = line.map_err(|err| CutError::BufLines(Box::new(err)))?;
         ranges
             .character_ranges
             .push(get_range_values(&line, character_ranges));
@@ -246,47 +248,120 @@ fn get_range_values(line: &str, ranges: &[ArgRange]) -> Vec<String> {
         .collect::<Vec<String>>()
 }
 
-fn get_arg_ranges(s: &str) -> Result<Vec<ArgRange>, CutError> {
+fn get_arg_ranges(s: &str) -> Result<Vec<ArgRange>, ArgRangeError> {
     s.split(',').map(ArgRange::from_str).collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum ArgRange {
     Full { start: usize, end: usize },
     RightOpen { start: usize },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ArgRangeError {
+    InvalidRangeInput,
+}
+
 impl ArgRange {
-    fn from_str(range: &str) -> Result<ArgRange, CutError> {
+    fn from_str(range: &str) -> Result<ArgRange, ArgRangeError> {
         // possible ranges
-        // -m  = 1-m
-        // n-  = n-end of line/last field
-        // 1-5 = pos 1 to pos 5
-        // 2-7 = pos 2 to pos 7
+        // ..m  = 1..m
+        // n..  = n..end of line/last field
+        // 1..5 = pos 1 to pos 5
+        // 2..7 = pos 2 to pos 7
         let ranges = range.split("..").collect::<Vec<&str>>();
 
         match ranges[..] {
             [n, ""] => {
                 let n = n
                     .parse::<usize>()
-                    .map_err(|_| CutError::InvalidRangeInput)?;
+                    .map_err(|_| ArgRangeError::InvalidRangeInput)?;
                 Ok(ArgRange::RightOpen { start: n })
             }
             ["", m] => {
                 let m = m
                     .parse::<usize>()
-                    .map_err(|_| CutError::InvalidRangeInput)?;
+                    .map_err(|_| ArgRangeError::InvalidRangeInput)?;
                 Ok(ArgRange::Full { start: 1, end: m })
             }
             [n, m] => {
                 let n = n
                     .parse::<usize>()
-                    .map_err(|_| CutError::InvalidRangeInput)?;
+                    .map_err(|_| ArgRangeError::InvalidRangeInput)?;
                 let m = m
                     .parse::<usize>()
-                    .map_err(|_| CutError::InvalidRangeInput)?;
+                    .map_err(|_| ArgRangeError::InvalidRangeInput)?;
                 Ok(ArgRange::Full { start: n, end: m })
             }
-            _ => Err(CutError::InvalidRangeInput),
+            _ => Err(ArgRangeError::InvalidRangeInput),
         }
+    }
+}
+#[cfg(test)]
+mod arg_range_tests {
+    use crate::{ArgRange, ArgRangeError};
+
+    #[test]
+    fn from_str_bounded_range() {
+        let range = "1..5";
+        let expected = ArgRange::Full { start: 1, end: 5 };
+        let actual = ArgRange::from_str(range);
+        assert_eq!(Ok(expected), actual);
+    }
+
+    #[test]
+    fn from_str_bounded_range_with_non_start_range() {
+        let range = "3..5";
+        let expected = ArgRange::Full { start: 3, end: 5 };
+        let actual = ArgRange::from_str(range);
+        assert_eq!(Ok(expected), actual);
+    }
+
+    #[test]
+    fn from_str_right_bounded_range() {
+        let range = "..5";
+        let expected = ArgRange::Full { start: 1, end: 5 };
+        let actual = ArgRange::from_str(range);
+        assert_eq!(Ok(expected), actual);
+    }
+
+    #[test]
+    fn from_str_left_bounded_range() {
+        let range = "1..";
+        let expected = ArgRange::RightOpen { start: 1 };
+        let actual = ArgRange::from_str(range);
+        assert_eq!(Ok(expected), actual);
+    }
+
+    #[test]
+    fn from_str_left_bounded_range_with_non_start_range() {
+        let range = "3..";
+        let expected = ArgRange::RightOpen { start: 3 };
+        let actual = ArgRange::from_str(range);
+        assert_eq!(Ok(expected), actual);
+    }
+
+    #[test]
+    fn invalid_input_gives_error() {
+        let range = "..";
+        let actual = ArgRange::from_str(range);
+        assert_eq!(Err(ArgRangeError::InvalidRangeInput), actual);
+
+        let range = "-1..";
+        let actual = ArgRange::from_str(range);
+        assert_eq!(Err(ArgRangeError::InvalidRangeInput), actual);
+
+        let range = "123";
+        let actual = ArgRange::from_str(range);
+        assert_eq!(Err(ArgRangeError::InvalidRangeInput), actual);
+
+        let range = "abc";
+        let actual = ArgRange::from_str(range);
+        assert_eq!(Err(ArgRangeError::InvalidRangeInput), actual);
+
+        let range = "34uy8902uofdlsajfkdals38..3oi4uoaejflkasjfds";
+        let actual = ArgRange::from_str(range);
+        assert_eq!(Err(ArgRangeError::InvalidRangeInput), actual);
     }
 }
