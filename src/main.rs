@@ -1,7 +1,7 @@
 use std::{
+    collections::HashSet,
     error::Error,
-    io::Write,
-    io::{self, BufRead, Read},
+    io::{self, BufRead, Read, Write},
 };
 
 use clap::Parser;
@@ -171,6 +171,8 @@ fn cut(file: &str, w: &mut impl Write, args: &Args) -> Result<(), CutError> {
         _ => return Err(CutError::MultipleLists),
     };
 
+    let arg_ranges = merge_arg_ranges(&arg_ranges);
+
     if file == "-" {
         read_lines(io::stdin(), w, &arg_ranges)
     } else {
@@ -180,6 +182,37 @@ fn cut(file: &str, w: &mut impl Write, args: &Args) -> Result<(), CutError> {
             &arg_ranges,
         )
     }
+}
+
+// we need to merge these arg ranges
+// so we have a left and an optional right
+// 1..?
+// This can be 1..5, 8..9  - so we need 2 separate ranges because they don't overlap
+// Or it can be 1..5, 3..7 - so we need a single range as these do overlap
+// Or it can be 1..8, 3..5 - so we need a single range as 1..8 overlaps 3..5
+//
+// So we need to know what ranges we've got already
+// 1..5 - we need to store this range
+// 8..9 - we then need to store this range
+//
+// 1..5 - we need to store this range
+// 3..7 - then we need to see that the start idx 3 is contained in the range 1..5.
+// And then we need to see that end idx 7 is greater than the 5 and so update this overlapping range to take the higher bound
+// NOTE: the inverse also applies here, we need to check lower bounds
+//
+// 1..8 - we need to store this range
+// 3..5 - then we need to see that the start idx 3 is contained in the range 1..8 AND the 5
+//   is contained in the range 1..8 - we would remove this range as it's already covered
+fn merge_arg_ranges(arg_ranges: &[ArgRange]) -> Vec<ArgRange> {
+    let mut bound_sets: HashSet<ArgRange> = HashSet::new();
+    for range in arg_ranges {
+        let start = range.start;
+        let overlapping_bound = bound_sets
+            .iter()
+            .find(|range_bound| start > range_bound.start);
+    }
+    todo!()
+    // bound_sets.iter().collect()
 }
 
 fn read_lines(r: impl Read, w: &mut impl Write, arg_range: &[ArgRange]) -> Result<(), CutError> {
@@ -197,9 +230,9 @@ fn get_range_values(line: &str, ranges: &[ArgRange]) -> String {
     ranges
         .iter()
         .map(|r| {
-            String::from(match r {
-                ArgRange::Full { start, end } => &line[*start - 1..*end],
-                ArgRange::RightOpen { start } => &line[*start - 1..line.len()],
+            String::from(match r.end {
+                Some(end) => &line[r.start - 1..end],
+                None => &line[r.start - 1..line.len()],
             })
         })
         .collect::<String>()
@@ -209,10 +242,10 @@ fn get_arg_ranges(s: &str) -> Result<Vec<ArgRange>, ArgRangeError> {
     s.split(',').map(ArgRange::from_str).collect()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum ArgRange {
-    Full { start: usize, end: usize },
-    RightOpen { start: usize },
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ArgRange {
+    start: usize,
+    end: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -221,6 +254,10 @@ enum ArgRangeError {
 }
 
 impl ArgRange {
+    fn new(start: usize, end: Option<usize>) -> Self {
+        Self { start, end }
+    }
+
     fn from_str(range: &str) -> Result<ArgRange, ArgRangeError> {
         // possible ranges
         // ..m  = 1..m
@@ -234,13 +271,13 @@ impl ArgRange {
                 let n = n
                     .parse::<usize>()
                     .map_err(|_| ArgRangeError::InvalidRangeInput)?;
-                Ok(ArgRange::RightOpen { start: n })
+                Ok(ArgRange::new(n, None))
             }
             ["", m] => {
                 let m = m
                     .parse::<usize>()
                     .map_err(|_| ArgRangeError::InvalidRangeInput)?;
-                Ok(ArgRange::Full { start: 1, end: m })
+                Ok(ArgRange::new(1, Some(m)))
             }
             [n, m] => {
                 let n = n
@@ -249,7 +286,7 @@ impl ArgRange {
                 let m = m
                     .parse::<usize>()
                     .map_err(|_| ArgRangeError::InvalidRangeInput)?;
-                Ok(ArgRange::Full { start: n, end: m })
+                Ok(ArgRange::new(n, Some(m)))
             }
             _ => Err(ArgRangeError::InvalidRangeInput),
         }
@@ -262,7 +299,7 @@ mod arg_range_tests {
     #[test]
     fn from_str_bounded_range() {
         let range = "1..5";
-        let expected = ArgRange::Full { start: 1, end: 5 };
+        let expected = ArgRange::new(1, Some(5));
         let actual = ArgRange::from_str(range);
         assert_eq!(Ok(expected), actual);
     }
@@ -270,7 +307,7 @@ mod arg_range_tests {
     #[test]
     fn from_str_bounded_range_with_non_start_range() {
         let range = "3..5";
-        let expected = ArgRange::Full { start: 3, end: 5 };
+        let expected = ArgRange::new(3, Some(5));
         let actual = ArgRange::from_str(range);
         assert_eq!(Ok(expected), actual);
     }
@@ -278,7 +315,7 @@ mod arg_range_tests {
     #[test]
     fn from_str_right_bounded_range() {
         let range = "..5";
-        let expected = ArgRange::Full { start: 1, end: 5 };
+        let expected = ArgRange::new(1, Some(5));
         let actual = ArgRange::from_str(range);
         assert_eq!(Ok(expected), actual);
     }
@@ -286,7 +323,7 @@ mod arg_range_tests {
     #[test]
     fn from_str_left_bounded_range() {
         let range = "1..";
-        let expected = ArgRange::RightOpen { start: 1 };
+        let expected = ArgRange::new(1, None);
         let actual = ArgRange::from_str(range);
         assert_eq!(Ok(expected), actual);
     }
@@ -294,7 +331,7 @@ mod arg_range_tests {
     #[test]
     fn from_str_left_bounded_range_with_non_start_range() {
         let range = "3..";
-        let expected = ArgRange::RightOpen { start: 3 };
+        let expected = ArgRange::new(3, None);
         let actual = ArgRange::from_str(range);
         assert_eq!(Ok(expected), actual);
     }
@@ -320,5 +357,60 @@ mod arg_range_tests {
         let range = "34uy8902uofdlsajfkdals38..3oi4uoaejflkasjfds";
         let actual = ArgRange::from_str(range);
         assert_eq!(Err(ArgRangeError::InvalidRangeInput), actual);
+    }
+}
+
+#[cfg(test)]
+mod merge_arg_ranges_tests {
+    use crate::{ArgRange, merge_arg_ranges};
+
+    #[test]
+    fn merges_two_overlapping_ranges() {
+        let left_range = ArgRange::new(1, Some(4));
+        let right_range = ArgRange::new(3, Some(5));
+        let ranges = vec![left_range, right_range];
+        let actual_ranges = merge_arg_ranges(&ranges);
+
+        assert_eq!(vec![ArgRange::new(1, Some(5))], actual_ranges);
+
+        let left_range = ArgRange::new(1, Some(4));
+        let right_range = ArgRange::new(3, Some(5));
+        let ranges_out_of_order = vec![right_range, left_range];
+        let actual_ranges = merge_arg_ranges(&ranges_out_of_order);
+
+        assert_eq!(vec![ArgRange::new(1, Some(5))], actual_ranges);
+    }
+    #[test]
+    fn merges_containing_ranges() {
+        let outer_range = ArgRange::new(1, Some(5));
+        let inner_range = ArgRange::new(3, Some(4));
+        let ranges = vec![outer_range, inner_range];
+        let actual_ranges = merge_arg_ranges(&ranges);
+
+        assert_eq!(vec![ArgRange::new(1, Some(5))], actual_ranges);
+
+        let outer_range = ArgRange::new(1, Some(5));
+        let inner_range = ArgRange::new(3, Some(4));
+        let ranges = vec![inner_range, outer_range];
+        let actual_ranges = merge_arg_ranges(&ranges);
+
+        assert_eq!(vec![ArgRange::new(1, Some(5))], actual_ranges);
+    }
+
+    #[test]
+    fn keeps_separate_ranges() {
+        let left_range = ArgRange::new(1, Some(5));
+        let right_range = ArgRange::new(6, Some(8));
+        let ranges = vec![left_range, right_range];
+        let actual_ranges = merge_arg_ranges(&ranges);
+
+        assert_eq!(vec![left_range, right_range], actual_ranges);
+
+        let left_range = ArgRange::new(1, Some(5));
+        let right_range = ArgRange::new(6, Some(8));
+        let ranges = vec![right_range, left_range];
+        let actual_ranges = merge_arg_ranges(&ranges);
+
+        assert_eq!(vec![right_range, left_range], actual_ranges);
     }
 }
