@@ -1,8 +1,4 @@
-use std::{
-    collections::HashSet,
-    error::Error,
-    io::{self, BufRead, Read, Write},
-};
+use std::io::{self, BufRead, Read, Write};
 
 use clap::Parser;
 
@@ -22,7 +18,7 @@ In the table which follows, the byte-list, character-list, and field-list are on
 
 An exit status of zero indicates success, and a nonzero value indicates failure.
 */
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Default)]
 #[command(version, about, long_about = None)]
 struct Args {
     /// Select for printing only the bytes in positions listed in byte-list. Tabs and backspaces are treated like any other character; they take up 1 byte. If an output delimiter is specified, (see the description of --output-delimiter), then output that string between ranges of selected bytes.
@@ -121,9 +117,14 @@ struct Args {
     files: Vec<String>,
 }
 
-enum CutError {
+enum RustCutError {
     Io(std::io::Error),
-    BufLines(Box<dyn Error>),
+    CutError(CutError),
+}
+
+#[derive(PartialEq, Eq)]
+enum CutError {
+    BufLines(String),
     ArgRange(ArgRangeError),
     MultipleLists,
 }
@@ -131,7 +132,6 @@ enum CutError {
 impl std::fmt::Debug for CutError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let message = match self {
-            CutError::Io(error) => format!("Error opening file: {error}"),
             CutError::BufLines(error) => {
                 format!("Error getting the lines from the buf reader: {}", error)
             }
@@ -140,11 +140,30 @@ impl std::fmt::Debug for CutError {
             },
             CutError::MultipleLists => String::from("only 1 type of list may be specified"),
         };
+
         f.write_str(&message)
     }
 }
 
-fn main() -> Result<(), CutError> {
+impl std::fmt::Debug for RustCutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            RustCutError::Io(error) => format!("Io error: {error}"),
+            RustCutError::CutError(CutError::BufLines(error)) => {
+                format!("Error getting the lines from the buf reader: {}", error)
+            }
+            RustCutError::CutError(CutError::ArgRange(err)) => match err {
+                ArgRangeError::InvalidRangeInput => String::from("Invalid range input provided"),
+            },
+            RustCutError::CutError(CutError::MultipleLists) => {
+                String::from("only 1 type of list may be specified")
+            }
+        };
+        f.write_str(&message)
+    }
+}
+
+fn main() -> Result<(), RustCutError> {
     let mut args = Args::parse();
 
     // add stdin if the files are empty
@@ -152,12 +171,21 @@ fn main() -> Result<(), CutError> {
         args.files.push("-".to_string());
     }
     for file in &args.files {
-        cut(file, &mut io::stdout(), &args)?;
+        let result = if file == "-" {
+            cut(io::stdin(), &mut io::stdout(), &args)
+        } else {
+            cut(
+                std::fs::File::open(file).map_err(RustCutError::Io)?,
+                &mut io::stdout(),
+                &args,
+            )
+        };
+        result.map_err(RustCutError::CutError)?;
     }
     Ok(())
 }
 
-fn cut(file: &str, w: &mut impl Write, args: &Args) -> Result<(), CutError> {
+fn cut(r: impl Read, w: &mut impl Write, args: &Args) -> Result<(), CutError> {
     // we don't allow 2 lists
     let arg_ranges = match (
         args.bytes.as_ref(),
@@ -173,15 +201,7 @@ fn cut(file: &str, w: &mut impl Write, args: &Args) -> Result<(), CutError> {
 
     let arg_ranges = merge_arg_ranges(&arg_ranges);
 
-    if file == "-" {
-        read_lines(io::stdin(), w, &arg_ranges)
-    } else {
-        read_lines(
-            std::fs::File::open(file).map_err(CutError::Io)?,
-            w,
-            &arg_ranges,
-        )
-    }
+    read_lines(r, w, &arg_ranges)
 }
 
 // we need to merge these arg ranges
@@ -204,24 +224,53 @@ fn cut(file: &str, w: &mut impl Write, args: &Args) -> Result<(), CutError> {
 // 3..5 - then we need to see that the start idx 3 is contained in the range 1..8 AND the 5
 //   is contained in the range 1..8 - we would remove this range as it's already covered
 fn merge_arg_ranges(arg_ranges: &[ArgRange]) -> Vec<ArgRange> {
-    let mut bound_sets: HashSet<ArgRange> = HashSet::new();
-    for range in arg_ranges {
-        let start = range.start;
-        let overlapping_bound = bound_sets
-            .iter()
-            .find(|range_bound| start > range_bound.start);
+    let mut found_ranges: Vec<ArgRange> = Vec::new();
+    'outer: for range in arg_ranges {
+        for found_range in &mut found_ranges {
+            if is_intersecting(range, found_range) {
+                found_range.start = std::cmp::min(range.start, found_range.start);
+                found_range.end = max_optionals(range.end, found_range.end);
+                continue 'outer;
+            }
+        }
+        found_ranges.push(*range);
     }
-    todo!()
-    // bound_sets.iter().collect()
+    found_ranges
+}
+
+fn is_intersecting(a: &ArgRange, b: &ArgRange) -> bool {
+    // test for the non intersecting case
+    // b: 5..8 a: 1..3
+    // a: 5..8 b: 1..3
+    !((a.start > b.start && a.end > b.end && test_left_gt_right(a.start, b.end))
+        || (b.start > a.start && b.end > a.end && test_left_gt_right(b.start, a.end)))
+}
+
+fn test_left_gt_right(left: usize, is_greater_than: Option<usize>) -> bool {
+    if let Some(right) = is_greater_than {
+        left > right
+    } else {
+        // right is greater than left
+        false
+    }
+}
+
+fn max_optionals(a: Option<usize>, b: Option<usize>) -> Option<usize> {
+    if let (Some(a), Some(b)) = (a, b) {
+        Some(std::cmp::max(a, b))
+    } else {
+        None
+    }
 }
 
 fn read_lines(r: impl Read, w: &mut impl Write, arg_range: &[ArgRange]) -> Result<(), CutError> {
     let lines_iter = io::BufReader::new(r).lines();
     for line in lines_iter {
-        let line = line.map_err(|err| CutError::BufLines(Box::new(err)))?;
+        let line = line.map_err(|err| CutError::BufLines(err.to_string()))?;
         let mut range_values = get_range_values(&line, arg_range);
         range_values.push('\n');
-        w.write(&range_values.into_bytes()).map_err(CutError::Io)?;
+        w.write(&range_values.into_bytes())
+            .map_err(|err| CutError::BufLines(err.to_string()))?;
     }
     Ok(())
 }
@@ -230,16 +279,26 @@ fn get_range_values(line: &str, ranges: &[ArgRange]) -> String {
     ranges
         .iter()
         .map(|r| {
-            String::from(match r.end {
-                Some(end) => &line[r.start - 1..end],
-                None => &line[r.start - 1..line.len()],
-            })
+            let line_len = line.len();
+            let start = r.start - 1;
+            let end = r.end.unwrap_or(line_len);
+            if line_len < start || end > line_len {
+                String::new()
+            } else {
+                String::from(&line[start..end])
+            }
         })
         .collect::<String>()
 }
 
 fn get_arg_ranges(s: &str) -> Result<Vec<ArgRange>, ArgRangeError> {
-    s.split(',').map(ArgRange::from_str).collect()
+    let mut res = s
+        .split(',')
+        .map(ArgRange::from_str)
+        .collect::<Result<Vec<ArgRange>, ArgRangeError>>()?;
+
+    res.sort_by_key(|range| range.start);
+    Ok(res)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -255,7 +314,16 @@ enum ArgRangeError {
 
 impl ArgRange {
     fn new(start: usize, end: Option<usize>) -> Self {
-        Self { start, end }
+        if let Some(end_unwrapped) = end
+            && start > end_unwrapped
+        {
+            Self {
+                start: end_unwrapped,
+                end: Some(start),
+            }
+        } else {
+            Self { start, end }
+        }
     }
 
     fn from_str(range: &str) -> Result<ArgRange, ArgRangeError> {
@@ -264,9 +332,10 @@ impl ArgRange {
         // n..  = n..end of line/last field
         // 1..5 = pos 1 to pos 5
         // 2..7 = pos 2 to pos 7
-        let ranges = range.split("..").collect::<Vec<&str>>();
+        let ranges = range.split("..").map(|s| s.trim()).collect::<Vec<&str>>();
 
         match ranges[..] {
+            [_, "0"] | ["0", _] => Err(ArgRangeError::InvalidRangeInput),
             [n, ""] => {
                 let n = n
                     .parse::<usize>()
@@ -292,6 +361,92 @@ impl ArgRange {
         }
     }
 }
+
+#[cfg(test)]
+mod cut_tests {
+
+    use crate::{Args, CutError, cut};
+
+    #[test]
+    fn fails_if_multiple_lists() {
+        let test_r = String::from("testing");
+        let mut w: Vec<u8> = Vec::new();
+        let args = Args {
+            bytes: Some(String::from("1..2")),
+            characters: Some(String::from("1..2")),
+            ..Default::default()
+        };
+        let actual = cut(test_r.as_bytes(), &mut w, &args);
+        assert_eq!(Err(CutError::MultipleLists), actual);
+    }
+
+    #[test]
+    fn simple_range() {
+        test_range("testing", "1..2", Ok(()), Some(b"te\n"));
+    }
+
+    #[test]
+    fn reverse_range() {
+        test_range("testing", "2..1", Ok(()), Some(b"te\n"));
+    }
+
+    #[test]
+    fn multiple_ranges() {
+        test_range("testing", "1..2,4..5", Ok(()), Some(b"teti\n"));
+    }
+
+    #[test]
+    fn multiple_ranges_spaced_comma() {
+        test_range("testing", "1..2, 4..5", Ok(()), Some(b"teti\n"));
+    }
+
+    #[test]
+    fn out_of_order_ranges() {
+        test_range("testing", "4..5,1..2", Ok(()), Some(b"teti\n"));
+    }
+
+    #[test]
+    fn out_of_order_reverse_ranges() {
+        test_range("testing", "5..4,2..1", Ok(()), Some(b"teti\n"));
+    }
+
+    #[test]
+    fn out_of_bounds() {
+        test_range("testing", "55..56", Ok(()), Some(b"\n"));
+    }
+
+    #[test]
+    fn reverse_out_of_bounds() {
+        test_range("testing", "56..55", Ok(()), Some(b"\n"));
+    }
+
+    fn test_range(
+        input: &str,
+        range: &str,
+        expected_res: Result<(), CutError>,
+        expected_bytes: Option<&[u8]>,
+    ) {
+        let test_r = String::from(input);
+        let mut w: Vec<u8> = Vec::new();
+        let args = Args {
+            characters: Some(String::from(range)),
+            ..Default::default()
+        };
+        let actual = cut(test_r.as_bytes(), &mut w, &args);
+        assert_eq!(expected_res, actual);
+        if let Some(b) = expected_bytes {
+            assert_eq!(b, w);
+        }
+
+        let args = Args {
+            bytes: Some(String::from(range)),
+            ..Default::default()
+        };
+        let actual = cut(test_r.as_bytes(), &mut w, &args);
+        assert_eq!(expected_res, actual);
+    }
+}
+
 #[cfg(test)]
 mod arg_range_tests {
     use crate::{ArgRange, ArgRangeError};
@@ -337,12 +492,32 @@ mod arg_range_tests {
     }
 
     #[test]
+    fn out_of_order_ranges_reordered() {
+        let range = "5..3";
+        let expected = ArgRange::new(3, Some(5));
+        let actual = ArgRange::from_str(range);
+        assert_eq!(Ok(expected), actual);
+    }
+
+    #[test]
     fn invalid_input_gives_error() {
+        let range = "0..1";
+        let actual = ArgRange::from_str(range);
+        assert_eq!(Err(ArgRangeError::InvalidRangeInput), actual);
+
+        let range = "1..0";
+        let actual = ArgRange::from_str(range);
+        assert_eq!(Err(ArgRangeError::InvalidRangeInput), actual);
+
         let range = "..";
         let actual = ArgRange::from_str(range);
         assert_eq!(Err(ArgRangeError::InvalidRangeInput), actual);
 
         let range = "-1..";
+        let actual = ArgRange::from_str(range);
+        assert_eq!(Err(ArgRangeError::InvalidRangeInput), actual);
+
+        let range = "..-1";
         let actual = ArgRange::from_str(range);
         assert_eq!(Err(ArgRangeError::InvalidRangeInput), actual);
 
